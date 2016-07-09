@@ -1,0 +1,460 @@
+/*!
+ *     COPYRIGHT NOTICE
+ *     Copyright (c) 2016，
+ *     All rights reserved.
+ *     
+ *
+ *     
+ *     
+ *
+ * @file       main.c
+ * @brief      K60 平台主程序
+ * @author    
+ * @version    v1.0
+ * @date       2016-3-13
+ */
+
+#include "common.h"
+#include "include.h"
+
+
+void LED_init(void)
+{
+  gpio_init  (PTC17,GPO,0);   //D1
+  gpio_init  (PTC16,GPO,0);   //D0
+  gpio_init  (PTC19,GPO,0);   //DC
+  gpio_init  (PTC18,GPO,1);   //RST
+  LCD_Init();
+}
+
+
+#define CAMERA_W            200              //定义摄像头图像宽度
+#define CAMERA_H            240              //定义摄像头图像高度
+#define CAMERA_R_H          40               //定义摄像头图像高度
+#define CAMERA_SIZE         CAMERA_W*CAMERA_H
+#define BLACK_C 0
+#define WHITE_C 254
+
+#define   EageMAX       000     //二值化后“最近”时一列包含的有效点的个数
+#define   EageMIN       000     //"最远”时，要求大于噪点在任一列最大可能产生的个数
+#define   APR           000     //“最近”时行（宽度）向有效点数的最小数量
+#define   ThreadHold    180     //赛道黑白分隔阈值，调整方法：静态放置车体若赛道轮廓不明显都为白色则将该值调大，否则调小，直至轮廓清楚
+#define   CENTURE       120     //中心值
+#define   servPram        3     //舵机转角比例系数
+#define     K             1     //电机部分
+#define     A             1     //电机部分
+#define   GETnumber      20     //有效列数大于GETnumber，就标记为找到图像
+#define   Delta_severMAX=CENTURE;//从中间向左或向右的最大偏差大小
+
+uint8 time=0;                            //搜索次数
+uint8 midlineGet=0;                         //方向标识符，值为1表示已经找到方向,作为输出值
+uint8 approchingFlag=0;                         //接近标识，值为1表示已经接近信标,作为输出值
+uint8 midline =120;                            //中线位置（初始为中心值） ，作为输出值
+int32 centureErr = 0;        //计算出的当前车体位置偏差 [有符号数]
+int32 servPWMDuty=700;       //舵机PWM占空比*/
+int32 initate_motorLeft;
+int32 initate_motorRight;
+int32 PWMDuty_motorLeft;     //左电机PWM占空比*/
+int32 PWMDuty_motorRight;    //右电机PWM占空比*/
+float Delta_sever;           // 转向偏差
+
+int16 speed_left,speed_right;// var编码器读取的真实值
+
+uint8 imgbuff[CAMERA_R_H][CAMERA_W];                             //定义存储接收图像的数组
+
+uint8 V_Cnt = 0;
+volatile IMG_STATUS_e      img_flag = IMG_START;        //图像状态
+
+uint16 VS=0;
+uint16 HS=0;
+
+uint8  sz[CAMERA_R_H]={ 30,31,32,
+                34,36,38,
+                41,44,47,
+                51,55,59,
+                64,69,74,
+                80,86,92,
+                98,104,110,
+                116,122,128,
+                134,140,146,
+                152,158,164,
+                170,176,182,
+                188,194,200,
+                206,212,218,
+                224//,230
+                };
+
+
+//函数声明
+void portb_handler();
+void portc_handler();
+void Imageproc();
+void compute_pwm();
+
+void runPID();
+void DMA_CH1_Handler(void);    //DMA是一种不经过CPU而直接从内存了存取数据的数据交换模式
+void DMA_CH2_Handler(void);
+void PIT0_IRQHandler(void);            //PIT0 定时中断服务函数
+void speed_set_left(int speed_set);
+void speed_set_right(int speed_set);
+
+void  main(void)
+{
+  
+    DisableInterrupts;
+    LED_init();
+    uart_init (UART4, 115200);                        
+
+    exti_init(PTC3,rising_up);                           //VS
+    exti_init(PTB7,rising_down);                         //HS
+    port_init(PTC0, ALT1 | DMA_FALLING | PULLUP );       //PCLK
+
+    set_vector_handler(PORTB_VECTORn , portb_handler);   //设置中断复位函数为 PORTB_IRQHandler
+    set_vector_handler(PORTC_VECTORn , portc_handler);   //设置中断复位函数为 PORTC_IRQHandler
+    
+     //DMA通道0初始化，PTA27触发源(默认上升沿)，源地址为PTE_B0_IN，目的地址为：IMG_BUFF，每次传输1Byte
+    dma_portx2buff_init(DMA_CH0, (void *)&PTE_B0_IN, (void *)imgbuff, PTC0, DMA_BYTE1, CAMERA_W, DADDR_KEEPON);
+     
+    enable_irq (PORTC_IRQn);                                    //                           A
+      //以下pid初始化  
+    gpio_init (PTA15, GPI,0);//检测正反转？ 
+    gpio_init (PTA17, GPI,0);
+
+    FTM_PWM_init(FTM0, FTM_CH1,10000,0);  //PTA4,精度10000
+    FTM_PWM_init(FTM0, FTM_CH2,10000,0);  //PTA5,精度10000  FTM_PWM_init(FTM0, FTM_CH6,200, 10);
+    FTM_PWM_init(FTM0, FTM_CH3,10000,0);  //PTA6,精度10000  //初始化 FTM0_CH6 为 频率 200Hz 的PWM，占空比为 10/FTM0_PRECISON
+    FTM_PWM_init(FTM0, FTM_CH4,10000,0);  //PTA7,精度10000  //这四个PWM是干么的？？？？   单片机用？？就是控制速度的那4个
+    
+    DMA_count_Init(DMA_CH1, PTA8, 0x7FFF, 0xA2u);
+    DMA_count_Init(DMA_CH2, PTB0, 0x7FFF, 0xA2u);
+    pit_init_ms(PIT0, 10);       //仅仅对应着一个延迟？？？中断    pit定时器开始计数是在pit_init_ms(PIT1,time)之后   PIT0中断（用于舵机PWM输出翻转IO口）和PIT1中断（用于FTM测速周期）
+
+    set_vector_handler(PIT0_VECTORn, PIT0_IRQHandler);    //把 porta_handler 函数添加到中断向量表，不需要我们手动调用
+
+    enable_irq(PIT0_IRQn);                          //开启输入捕捉中断                        B        AB是否该放到一起？
+    
+    EnableInterrupts;
+    
+   
+    while(1)
+    {  
+      LCD_Show_Number(5,2,123);
+      if(img_flag == IMG_FINISH)
+      {LCD_Show_Number(5,4,333);
+        img_flag = IMG_PROCESS;
+        
+        //---------图像二值化，小于阈值为BLACK，大于阈值为WHITE---------
+  /*  uint8 i,j=0;  
+    for(i=0; i<CAMERA_R_H; i++)
+    {
+        for(j=0;j<CAMERA_W ;j++)
+      {
+         if(imgbuff[i][j]<ThreadHold)              
+             imgbuff[i][j]=0;
+         else
+            imgbuff[i][j]=1;       
+      }
+  
+    } 
+        Imageproc();        //找寻信标方向+++
+    if(midlineGet=1)
+    {
+            initate_motorLeft=initate_motorRight=2000;
+            midlineGet=0;
+            compute_pwm();
+            runPID();                       //写入速度、方向
+    }
+     else
+        {
+          initate_motorLeft=initate_motorRight=0;
+          time++; 
+         }
+        */
+       //  if(time>=5) {     /*原地搜索*/    /*；break;time=0}  ;*/
+   
+        /********串口发送程序*************/
+        
+        uart_putchar(UART4,0xff);
+        for(int j = 0;j<CAMERA_R_H;j++)
+        {
+          for(int i = 0;i<CAMERA_W;i++)
+          {
+            if(imgbuff[j][i]==0xff)
+            {
+              imgbuff[j][i]=0xfe;
+            }
+            uart_putchar(UART4,imgbuff[j][i]);
+          }
+        }
+        
+        /*************液晶屏显示程序**********/
+        
+        for(int j=0;j<CAMERA_R_H;j++)
+        {
+          for(int i=CAMERA_W;i>0;i--)
+          {
+            if(i%4==0)
+            {
+              if(imgbuff[j][i]<100)
+              {
+              OLED_DrawPoint(i/4,64-j,1);
+              }
+              else
+              {
+                OLED_DrawPoint(i/4,64-j,0);
+              }
+            }
+            
+          }
+        }
+        OLED_Refresh_Gram();
+        
+        
+        PORTC_ISFR = ~0;               //写1清中断标志位(必须的，不然回导致一开中断就马上触发中断)
+        enable_irq(PORTC_IRQn);
+        img_flag = IMG_START;
+      }
+     
+    }
+}
+
+uint8 num;
+
+/*!
+ *  @brief      PORTB中断服务函数
+ *  @since      v5.0
+ */
+void portb_handler()
+{
+    uint8  n;    //引脚号
+    n = 7;                              //行中断
+    if(PORTB_ISFR & (1 << n))           //PTB7触发中断
+    {
+      PORTB_ISFR  = (1 << n);        //写1清中断标志位
+      HS++;
+      V_Cnt++;
+      if(V_Cnt <= CAMERA_H)
+      {
+        if(V_Cnt==sz[num])
+        {
+          systick_delay(400);
+          DMA_EN(DMA_CH0);
+          num++;
+        }
+      }
+      
+      else
+      {
+        disable_irq(PORTB_IRQn);
+        img_flag = IMG_FINISH;
+      }
+      
+    }
+
+
+}
+
+void portc_handler()
+{
+    uint8  n;    //引脚号
+    n = 3;                               //场中断
+    if(PORTC_ISFR & (1 << n))           //PTC3触发中断
+    {
+      PORTC_ISFR  = (1 << n);        //写1清中断标志位
+      VS++;
+      img_flag = IMG_GATHER;      
+      DMA_DADDR(DMA_CH0) = (uint32)imgbuff;    //恢复地址
+      V_Cnt = 0;
+      num=0;
+      enable_irq(PORTB_IRQn);
+      disable_irq(PORTC_IRQn);
+    }
+}
+
+/*!
+  *  @brief      方向识别和接近判断函数
+  *  @version    v1.0未测试
+  *  @date       2016-03-6
+*/
+void Imageproc()                                  //-----------1
+{
+    uint8 num=0;
+    uint8 pos[CAMERA_W]={0};
+    uint8 i,j=0;
+    uint8 sum=0;
+    uint8 apr=0;
+
+    for (j=0;j<CAMERA_W;j++)
+    {
+        for(i=0;i<CAMERA_R_H;i++)
+        {
+            sum=imgbuff[i][j]+sum;
+            if(sum>=EageMIN/*&&sum<=EageMAX*/)
+            {
+                pos[j]=j;
+                 num++;
+
+            }
+            if(sum>=EageMAX)
+                 apr++;
+
+        }
+    }
+     
+   
+     uint32 teamp_A=0;
+     for(j=0;j<CAMERA_W;j++)
+     {
+         teamp_A+=pos[j];
+     }
+     
+     if(num>=GETnumber)           //标识是否找到信标
+      { 
+           midlineGet=1;
+           midline =teamp_A/num;        //计算方向位置
+           LCD_Show_Number(5,1,midline);
+      }
+     
+     if(apr>=APR)                     //判断是否接近信标
+     {
+       approchingFlag=1;
+         LCD_Show_Number(5,2,approchingFlag);
+     }
+   
+}
+/*
+*  舵机和后电机的PWM输出值计算
+*
+*/
+void compute_pwm()
+{
+//----------------------sever---------------------------
+  
+        centureErr = midline - CENTURE;  //求车体偏移量
+        
+//---------------计算舵机转角---------------------------
+        
+   servPWMDuty = 700/*舵机中心位置PWM*/ + servPram*centureErr;
+     
+   //LCD_Show_Number(5,6,servPWMDuty);
+
+//----------------------motor---------------------------
+            Delta_sever=centureErr;
+   
+    PWMDuty_motorLeft=K*initate_motorLeft*(1+A*Delta_sever/120);//类型可能有误
+    PWMDuty_motorRight=K*initate_motorLeft*(1+A*Delta_sever/120);
+
+}
+
+
+//-------------------------------------------------------------PID控制速度---------------------------------------------
+
+void PIT0_IRQHandler()
+{
+    PIT_Flag_Clear(PIT0);       //清中断标志位
+    //speed_set_right(29);      //（9）的意思   刚开始脉冲是9   用脉冲自己设定的速度
+   // speed_set_left(29);
+//    speed_right = DMA_count_get(DMA_CH1);
+//    if(gpio_get(PTA9)==0)speed_right=-speed_right;
+//    DMA_count_reset(DMA_CH1);
+
+}
+
+int error_speed_left[3]={0};
+#define kp_speed_left 50
+#define ki_speed_left 8    //这些值从哪里来？自己测
+#define kd_speed_left 10
+int init_speed_left=0;
+
+void speed_set_left(int speed_set)
+{
+    int adjust_speed_left;
+
+    speed_left = DMA_count_get(DMA_CH2);     //计数寄存器   DMA累加计数
+    if(gpio_get(PTA17)==1)speed_left=-speed_left;
+    DMA_count_reset(DMA_CH2);
+
+    error_speed_left[2]=error_speed_left[1];
+    error_speed_left[1]=error_speed_left[0];
+    error_speed_left[0]=speed_set-speed_left;                                //原先是float  (int)(ki_speed_left*error_speed_left[0])
+
+    adjust_speed_left=kp_speed_left*(error_speed_left[0]-error_speed_left[1])+(int)(ki_speed_left*error_speed_left[0])+kd_speed_left*(error_speed_left[0]-2*error_speed_left[1]+error_speed_left[2]);
+    init_speed_left=init_speed_left+adjust_speed_left;
+
+    if(init_speed_left>9500)        //保护程序              //limit the max PWM for motor
+    {
+      init_speed_left=9500;
+    }
+    else if(init_speed_left<-9500)                    //limit the min PWM for motor
+    {
+      init_speed_left=-9500;
+    }
+
+
+    if(init_speed_left<0)
+    {
+
+      FTM_PWM_Duty(FTM0, FTM_CH4, -init_speed_left);    //什么意思   用处？？
+      FTM_PWM_Duty(FTM0, FTM_CH3, 0);
+    }
+    else
+    {
+      FTM_PWM_Duty(FTM0, FTM_CH3, init_speed_left);
+      FTM_PWM_Duty(FTM0, FTM_CH4, 0);
+    }
+}
+
+
+int error_speed_right[3]={0};
+#define kp_speed_right 50
+#define ki_speed_right 8
+#define kd_speed_right 10
+int init_speed_right=0;
+
+void speed_set_right(int speed_set)
+{
+    int adjust_speed_right;
+
+    speed_right = DMA_count_get(DMA_CH1);   //返回累加计数值
+    if(gpio_get(PTA15)==0)speed_right=-speed_right;
+    DMA_count_reset(DMA_CH1);
+
+    error_speed_right[2]=error_speed_right[1];
+    error_speed_right[1]=error_speed_right[0];
+    error_speed_right[0]=speed_set-speed_right;
+
+    adjust_speed_right=kp_speed_right*(error_speed_right[0]-error_speed_right[1])+(int)(ki_speed_right*error_speed_right[0])+kd_speed_right*(error_speed_right[0]-2*error_speed_right[1]+error_speed_right[2]);
+    init_speed_right=init_speed_right+adjust_speed_right;
+
+    if(init_speed_right>9500)                      //limit the max PWM for motor
+    {
+      init_speed_right=9500;
+    }
+    else if(init_speed_right<-9500)                    //limit the min PWM for motor
+    {
+      init_speed_right=-9500;
+    }
+
+
+    if(init_speed_right<0)
+    {
+
+      FTM_PWM_Duty(FTM0, FTM_CH1, -init_speed_right);
+      FTM_PWM_Duty(FTM0, FTM_CH2, 0);
+    }
+    else
+    {
+      FTM_PWM_Duty(FTM0, FTM_CH1, init_speed_right);
+      FTM_PWM_Duty(FTM0, FTM_CH2, 0);
+    }
+}
+
+
+void runPID()
+    {
+            LCD_Show_Number(1,1,speed_left);    //只是为了检测
+            LCD_Show_Number(40,1,speed_right);
+            FTM_PWM_Duty(FTM0, FTM_CH3, servPWMDuty); //舵机方向   这个时候写入对不对？？
+            speed_set_right(PWMDuty_motorRight/20);      // /20的意思   脉冲和设定的速度的换算关系
+            speed_set_left(PWMDuty_motorLeft/20);
+    }
