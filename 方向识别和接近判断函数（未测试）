@@ -1,0 +1,49 @@
+#define   EageMAX       000     //二值化后“最近”时一列包含的有效点的个数
+#define   EageMIN       000     //"最远”时，要求大于噪点在任一列最大可能产生的个数
+#define   midline       000     //中线位置（初始为中心值） ，作为输出值
+#define   approchingFlag  0     //接近标识，值为1表示已经接近信标,作为输出值
+#define   APR           000     //“最近”时行（宽度）向有效点数的最小数量
+
+/*!
+  *  @brief      方向识别和接近判断函数
+  *  @version    v1.0未测试
+  *  @date       2016-03-6
+*/
+void Imageproc()
+{
+    uint8 num=0;
+    uint8 pos[Imagewide]={0};
+    uint8 i,j=0;
+    uint8 sum=0;
+    uint8 apr=0;
+
+    for (j=0;j<Imagewide;j++)
+    {
+        for(i=0;i<Imagehigh;i++)
+        {
+            sum=Image[i][j]+sum;
+            if(sum>=EageMIN/*&&sum<=EageMAX*/)
+            {
+                pos[j]=j;
+                 mum++;
+
+            }
+            if(sum>=EageMAX)
+                 apr++;
+
+        }
+    }
+
+    if(apr>=APR)                 //判断是否接近信标
+        approchingFlag=1;
+         //LCD_Show_Number(5,2,approchingFlag);
+     uint32 team_A=0;
+     for(j=0;j<Imagewide;j++)
+     {
+         team_A+=pos[j];
+     }
+
+     midline =teamp_A/num;
+        //LCD_Show_Number(5,1,midline);
+
+}
